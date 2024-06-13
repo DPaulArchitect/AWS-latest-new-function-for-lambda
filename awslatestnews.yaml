@@ -1,0 +1,262 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: |
+  This microservice does two things, fetches the most recent 10 Blog posts, using Amazon EventBridge on a daily schedule, from the 'AWS Latest News' RSS feed and
+  adds then into a DynamoDB table. The second aspect of this microservice populates your web page with the 10 most recently added 
+  blog posts from DynamoDB using Lambda fronted by a function URL which sits on your application servers 
+
+  - Dynamodb table for stories and links
+  - Lambda function which grabs stories from the RSS feed
+  - Eventbridge rule which runs daily triggering the function
+  - Lambda function which is triggered by a function URL whenever your page is refreshed, grabbing the latest stories and displaying them on your webpage.
+
+
+Resources:
+
+  AWSNewsTable:
+    Type: "AWS::DynamoDB::Table"
+    Properties:
+      AttributeDefinitions: 
+      - 
+        AttributeName: "Date"
+        AttributeType: "S"
+      - 
+        AttributeName: "Title"
+        AttributeType: "S"
+      TableName: "AWSNews"
+      KeySchema: 
+      - 
+        AttributeName: "Date"
+        KeyType: "HASH"
+      - 
+        AttributeName: "Title"
+        KeyType: "RANGE"
+      ProvisionedThroughput: 
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+
+    
+  RSSLambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Path: "/"
+      RoleName: "RSSLambdaRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "RSSLambdaPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: "SNS"
+                Effect: "Allow"
+                Action:
+                  - "dynamodb:GetItem"
+                  - "dynamodb:PutItem"
+                  - "dynamodb:Query"
+                  - "dynamodb:Scan"
+                  - "dynamodb:BatchGetItem"
+                  - "dynamodb:DescribeTable"
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/AWSNews"
+              - Sid: "Logging"  
+                Effect: "Allow"
+                Action: 
+                  - "logs:CreateLogGroup"
+                Resource: 
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Sid: "CreateLogStream"  
+                Effect: "Allow"
+                Action: 
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: 
+                  - "*"   
+
+  RSSLambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: "index.lambda_handler"
+      Role: !GetAtt RSSLambdaRole.Arn
+      Runtime: "python3.12"
+      FunctionName: RSSLambdaFunction
+
+
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import feedparser
+          import datetime
+          import logging
+          import os
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info("Starting the Lambda function")
+
+              # URL of the AWS blog RSS feed
+              feed_url = 'https://aws.amazon.com/blogs/aws/feed/'
+              feed = feedparser.parse(feed_url)
+
+              # DynamoDB setup
+              dynamodb = boto3.resource('dynamodb')
+              table_name = ('AWSNews')  # Corrected to use table name
+              table = dynamodb.Table(table_name)
+              logger.info("DynamoDB table accessed")
+
+              # Process the feed entries
+              for entry in feed.entries[:10]:  # Get top 10 news items
+                  date = entry.published_parsed
+                  formatted_date = datetime.datetime(date[0], date[1], date[2]).strftime('%Y%m%d')
+                  title = entry.title
+                  summary = entry.summary
+                  link = entry.link
+
+                  # Save to DynamoDB
+                  response = table.put_item(
+                      Item={
+                          'Date': formatted_date,
+                          'Title': title,
+                          'Summary': summary,
+                          'Link': link
+                      }
+                  )
+                  logger.info(f"Item saved to DynamoDB: {title}")
+
+              logger.info("Lambda function completed successfully")
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('News updated successfully')
+              }
+
+      MemorySize: 128
+      Timeout: 183
+      TracingConfig:
+        Mode: "PassThrough"
+      EphemeralStorage:
+        Size: 512
+      Layers:
+        - arn:aws:lambda:us-east-1:834243533825:layer:feedparser-layer:2
+
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt RSSLambdaFunction.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt EventsRule.Arn
+
+
+  EventsRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Name: "daily"
+      ScheduleExpression: "cron(0 9 * * ? *)"
+      State: "ENABLED"
+      Targets: 
+      - Id: "TargetFunction"
+        Arn: !GetAtt RSSLambdaFunction.Arn
+      EventBusName: "default"
+
+  UpdateWebpageRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Path: "/"
+      RoleName: "UpdateWebpageRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "UpdateWebpagePolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: "SNS"
+                Effect: "Allow"
+                Action:
+                  - "dynamodb:GetItem"
+                  - "dynamodb:Query"
+                  - "dynamodb:Scan"
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/AWSNews"
+              - Sid: "Logging"  
+                Effect: "Allow"
+                Action: 
+                  - "logs:CreateLogGroup"
+                Resource: 
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Sid: "CreateLogStream"  
+                Effect: "Allow"
+                Action: 
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: 
+                  - "*"   
+
+  UpdateWebpageFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: "index.lambda_handler"
+      Role: !GetAtt UpdateWebpageRole.Arn
+      Runtime: "python3.12"
+      FunctionName: UpdateWebpageFunction
+
+
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+
+          # Set up logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              # DynamoDB setup
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table('AWSNews')
+
+              # Scan DynamoDB for news items
+              try:
+                  response = table.scan(Limit=10)  # Scan the table for items
+                  items = response['Items']
+
+                  # Sort the items by date in descending order
+                  sorted_items = sorted(items, key=lambda x: x['Date'], reverse=True)[:10]
+
+                  logger.info(f"Items retrieved: {len(sorted_items)}")
+              except Exception as e:
+                  logger.error(f"Error scanning DynamoDB: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps("Error scanning DynamoDB")
+                  }
+
+              # Return the items
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(sorted_items)
+              }
+
+
+      MemorySize: 128
+      Timeout: 183
+      TracingConfig:
+        Mode: "PassThrough"
+      EphemeralStorage:
+        Size: 512
+   
